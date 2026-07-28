@@ -1,0 +1,204 @@
+name: Sync upstream & build staging release
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"   # weekly, every Sunday 03:00 UTC (every 7 days)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: "https://github.com/termux/termux-app.git"
+  UPSTREAM_BRANCH: "master"
+  FORK_BRANCH: "main"
+  RELEASE_TAG: "staging"
+  TERMUX_PACKAGE_VARIANT: "apt-android-7"
+  TERMUX_SPLIT_APKS_FOR_DEBUG_BUILDS: "1"
+  TERMUX_APK_VERSION_TAG: "apt-android-7-github"
+
+jobs:
+  sync-build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FORK_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" || true
+          git fetch upstream "$UPSTREAM_BRANCH"
+
+      - name: Merge upstream into fork branch
+        id: merge
+        run: |
+          set -e
+          BEFORE=$(git rev-parse HEAD)
+          if git merge "upstream/${UPSTREAM_BRANCH}" --no-edit; then
+            AFTER=$(git rev-parse HEAD)
+            if [ "$BEFORE" != "$AFTER" ]; then
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              git log --pretty=format:"- %h %s" "$BEFORE".."$AFTER" > commit_log.txt
+            else
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              echo "No new commits from upstream." > commit_log.txt
+            fi
+          else
+            echo "Merge conflict — aborting merge, stopping workflow." >&2
+            git merge --abort
+            exit 1
+          fi
+
+      - name: Push merged branch back to fork
+        if: steps.merge.outputs.changed == 'true'
+        run: git push origin "HEAD:${FORK_BRANCH}"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Locate arm64-v8a debug APK
+        id: find_apk
+        run: |
+          mkdir -p staging-apks
+          APK=$(find . -type f -name "*arm64-v8a.apk" -path "*/outputs/apk/debug/*" | head -n1)
+          if [ -z "$APK" ]; then
+            echo "No arm64-v8a debug APK found — check TERMUX_APK_VERSION_TAG / build output." >&2
+            exit 1
+          fi
+          cp "$APK" staging-apks/termux-app-staging-arm64-v8a.apk
+
+      - name: Clone termux-api (upstream)
+        run: git clone --depth 1 https://github.com/termux/termux-api.git ../termux-api
+
+      - name: Build termux-api debug APK
+        working-directory: ../termux-api
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Copy termux-api APK
+        run: |
+          APK=$(find ../termux-api -type f -name "*.apk" -path "*/outputs/apk/debug/*" | head -n1)
+          if [ -z "$APK" ]; then
+            echo "No termux-api debug APK found." >&2
+            exit 1
+          fi
+          echo "api_sha=$(git -C ../termux-api rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          cp "$APK" staging-apks/termux-api-staging.apk
+
+      - name: Clone termux-x11 (upstream, with submodules)
+        run: git clone --recurse-submodules --depth 1 https://github.com/termux/termux-x11.git ../termux-x11
+
+      - name: Build termux-x11 debug APK
+        working-directory: ../termux-x11
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Copy termux-x11 APK
+        run: |
+          APK=$(find ../termux-x11 -type f -name "*arm64-v8a*.apk" -path "*/outputs/apk/debug/*" | head -n1)
+          if [ -z "$APK" ]; then
+            echo "No termux-x11 debug APK found — check the build output/task name." >&2
+            exit 1
+          fi
+          echo "x11_sha=$(git -C ../termux-x11 rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          cp "$APK" staging-apks/termux-x11-staging.apk
+
+      - name: Compute release metadata
+        id: meta
+        run: |
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d-%H%M)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish staging pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: "Staging build ${{ steps.meta.outputs.date }} (${{ steps.meta.outputs.sha_short }})"
+          body: |
+            Automated Termux staging build.
+
+            termux-app: merged from upstream `${{ env.UPSTREAM_REPO }}@${{ env.UPSTREAM_BRANCH }}`, commit `${{ steps.meta.outputs.sha_short }}`
+            termux-api: upstream commit `${{ env.api_sha }}`
+            termux-x11: upstream commit `${{ env.x11_sha }}`
+          prerelease: true
+          target_commitish: ${{ env.FORK_BRANCH }}
+          files: staging-apks/*.apk
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify Telegram on success
+        if: success() && github.event_name != 'schedule'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          {
+            echo "✅ *Termux staging build succeeded*"
+            echo "termux-app: \`${{ steps.meta.outputs.sha_short }}\`"
+            echo "termux-api: \`${{ env.api_sha }}\`"
+            echo "termux-x11: \`${{ env.x11_sha }}\`"
+            echo ""
+            echo "*Recent changes merged into termux-app from upstream:*"
+            echo '```'
+            tail -c 3000 commit_log.txt
+            echo '```'
+          } > tg_message.txt
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "parse_mode=Markdown" \
+            --data-urlencode "text@tg_message.txt"
+
+          for apk in staging-apks/*.apk; do
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+              -F "chat_id=${TELEGRAM_CHAT_ID}" \
+              -F "document=@${apk}" \
+              -F "caption=$(basename "$apk")"
+          done
+
+      - name: Notify Telegram on failure
+        if: failure() && github.event_name != 'schedule'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          LOG_TAIL=$(gh run view "${{ github.run_id }}" --log-failed 2>/dev/null | tail -c 3000)
+          if [ -z "$LOG_TAIL" ]; then LOG_TAIL="(log unavailable — check the run directly)"; fi
+
+          {
+            echo "❌ *Termux staging build failed*"
+            echo "Run: $RUN_URL"
+            echo ""
+            echo '```'
+            echo "$LOG_TAIL"
+            echo '```'
+          } > tg_fail.txt
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "parse_mode=Markdown" \
+            --data-urlencode "text@tg_fail.txt"
