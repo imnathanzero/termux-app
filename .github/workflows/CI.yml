@@ -118,13 +118,13 @@ jobs:
 
       - name: Copy termux-x11 APK
         run: |
-          APK=$(find ../termux-x11 -type f -name "*arm64-v8a*.apk" -path "*/outputs/apk/debug/*" | head -n1)
+          APK=$(find ../termux-x11 -type f -name "lorie*.apk" -path "*/outputs/apk/debug/*" | head -n1)
           if [ -z "$APK" ]; then
             echo "No termux-x11 debug APK found — check the build output/task name." >&2
             exit 1
           fi
           echo "x11_sha=$(git -C ../termux-x11 rev-parse --short HEAD)" >> "$GITHUB_ENV"
-          cp "$APK" staging-apks/termux-x11-staging.apk
+          cp "$APK" staging-apks/lorie-app-debug.apk
 
       - name: Compute release metadata
         id: meta
